@@ -1,4 +1,8 @@
+from datetime import date
+
 from pawpal_system import CareTask, ConstraintSet, Scheduler, TimeWindow
+
+_PLAN_DAY = date(2026, 3, 27)
 
 
 def _task(
@@ -15,6 +19,7 @@ def _task(
         duration_minutes=duration,
         priority=priority,
         is_required=is_required,
+        due_date=_PLAN_DAY,
     )
 
 
@@ -27,7 +32,7 @@ def test_scheduler_respects_daily_time_limit() -> None:
     ]
     constraints = ConstraintSet(max_daily_minutes=60)
 
-    plan = scheduler.build_plan(tasks, constraints, target_date="2026-03-27")
+    plan = scheduler.build_plan(tasks, constraints, target_date=_PLAN_DAY.isoformat())
 
     assert plan.total_minutes <= 60
     scheduled_titles = [item.task.title for item in plan.items]
@@ -55,7 +60,7 @@ def test_scheduler_avoids_blocked_window() -> None:
         blocked_time_windows=[TimeWindow(start_time="08:00", end_time="09:00")],
     )
 
-    plan = scheduler.build_plan(tasks, constraints, target_date="2026-03-27")
+    plan = scheduler.build_plan(tasks, constraints, target_date=_PLAN_DAY.isoformat())
 
     assert len(plan.items) == 1
     assert plan.items[0].start_time == "09:00"

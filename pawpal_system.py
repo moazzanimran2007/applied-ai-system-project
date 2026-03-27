@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 import uuid
 
@@ -69,6 +69,9 @@ class CareTask:
     is_required: bool = False
     notes: str = ""
     is_complete: bool = False
+    time: str = "09:00"
+    pet_name: str = ""
+    due_date: date = field(default_factory=date.today)
 
     def estimate_effort_score(self) -> float:
         """Return a rough scheduling weight from priority, required flag, and duration."""
@@ -83,6 +86,30 @@ class CareTask:
     def mark_complete(self) -> None:
         """Mark this task as finished."""
         self.is_complete = True
+
+    def next_occurrence_after(self, completed_on: date) -> CareTask | None:
+        """If frequency is daily or weekly, return a new open task due after ``completed_on`` using timedelta; else None."""
+        if self.frequency == "daily":
+            delta = timedelta(days=1)
+        elif self.frequency == "weekly":
+            delta = timedelta(days=7)
+        else:
+            return None
+        next_due = completed_on + delta
+        return CareTask(
+            task_id=str(uuid.uuid4()),
+            title=self.title,
+            category=self.category,
+            duration_minutes=self.duration_minutes,
+            priority=self.priority,
+            frequency=self.frequency,
+            is_required=self.is_required,
+            notes=self.notes,
+            is_complete=False,
+            time=self.time,
+            pet_name=self.pet_name,
+            due_date=next_due,
+        )
 
 
 @dataclass
@@ -130,6 +157,7 @@ class DailyPlan:
     total_minutes: int = 0
     leftover_minutes: int = 0
     skipped_reasons: list[str] = field(default_factory=list)
+    conflict_warnings: list[str] = field(default_factory=list)
 
     def add_item(self, item: DailyPlanItem) -> None:
         """Append one scheduled block to the plan."""
@@ -143,7 +171,7 @@ class DailyPlan:
     def explain(self) -> list[str]:
         """Return human-readable lines for each item plus any skip messages."""
         explanations = [f"{i.start_time}-{i.end_time}: {i.task.title} ({i.reason})" for i in self.items]
-        return explanations + self.skipped_reasons
+        return explanations + self.skipped_reasons + self.conflict_warnings
 
 
 class Scheduler:
@@ -166,6 +194,34 @@ class Scheduler:
 
         return sorted(tasks, key=score, reverse=True)
 
+    def sort_by_time(self, tasks: list[CareTask]) -> list[CareTask]:
+        """Return tasks ordered by ``CareTask.time`` (HH:MM), using minutes since midnight as the sort key."""
+        return sorted(tasks, key=lambda t: _time_to_minutes(t.time))
+
+    @staticmethod
+    def _plan_slots_overlap(start_a: str, end_a: str, start_b: str, end_b: str) -> bool:
+        """True if two half-open [start, end) plan intervals intersect in clock time."""
+        sa, ea = _time_to_minutes(start_a), _time_to_minutes(end_a)
+        sb, eb = _time_to_minutes(start_b), _time_to_minutes(end_b)
+        return max(sa, sb) < min(ea, eb)
+
+    def find_time_conflicts(self, plan: DailyPlan) -> list[str]:
+        """Lightweight O(n^2) overlap scan: return warning strings only (never raises)."""
+        warnings: list[str] = []
+        items = plan.items
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                a, b = items[i], items[j]
+                if not self._plan_slots_overlap(a.start_time, a.end_time, b.start_time, b.end_time):
+                    continue
+                pa = a.task.pet_name.strip() or "(no pet)"
+                pb = b.task.pet_name.strip() or "(no pet)"
+                warnings.append(
+                    f"Time overlap: '{a.task.title}' ({pa}) [{a.start_time}-{a.end_time}] vs "
+                    f"'{b.task.title}' ({pb}) [{b.start_time}-{b.end_time}]"
+                )
+        return warnings
+
     def _shift_to_next_available(self, start_minute: int, duration: int, blocked: list[TimeWindow]) -> int:
         """Return the earliest start minute where a block of length duration avoids blocked windows."""
         candidate = start_minute
@@ -186,7 +242,17 @@ class Scheduler:
         """Build a feasible daily plan from ranked tasks, skipping what exceeds the time budget."""
         target_date = target_date or date.today().isoformat()
         plan = DailyPlan(date=target_date)
-        ranked_tasks = self.rank_tasks([t for t in tasks if constraints.validate_task(t)], constraints)
+        plan_day = date.fromisoformat(target_date)
+        ranked_tasks = self.rank_tasks(
+            [
+                t
+                for t in tasks
+                if constraints.validate_task(t)
+                and not t.is_complete
+                and t.due_date == plan_day
+            ],
+            constraints,
+        )
         used_minutes = 0
         current_start = _time_to_minutes("08:00")
         required_categories = set(constraints.must_include_categories)
@@ -224,6 +290,7 @@ class Scheduler:
             used_minutes += task.duration_minutes
 
         plan.compute_totals(constraints.max_daily_minutes)
+        plan.conflict_warnings = self.find_time_conflicts(plan)
         return plan
 
 
@@ -270,6 +337,34 @@ class TaskRepository:
         """Return a shallow copy of all stored tasks."""
         return list(self.tasks)
 
+    def filter_tasks(
+        self,
+        *,
+        is_complete: bool | None = None,
+        pet_name: str | None = None,
+    ) -> list[CareTask]:
+        """Return tasks matching completion status and/or pet name (case-insensitive); omit a filter to skip it."""
+        result = self.list_tasks()
+        if is_complete is not None:
+            result = [t for t in result if t.is_complete is is_complete]
+        if pet_name is not None:
+            want = pet_name.strip().lower()
+            result = [t for t in result if t.pet_name.strip().lower() == want]
+        return result
+
+    def complete_task(self, task_id: str, *, completion_date: date | None = None) -> CareTask | None:
+        """Mark the task complete; for daily/weekly tasks append the next occurrence and return that new task."""
+        completion_date = completion_date or date.today()
+        for task in self.tasks:
+            if task.task_id != task_id:
+                continue
+            task.mark_complete()
+            nxt = task.next_occurrence_after(completion_date)
+            if nxt is not None:
+                self.add_task(nxt)
+            return nxt
+        raise KeyError(task_id)
+
 
 class PawPalAppController:
     def __init__(
@@ -304,6 +399,10 @@ class PawPalAppController:
         category: str = "general",
         is_required: bool = False,
         notes: str = "",
+        time: str = "09:00",
+        pet_name: str = "",
+        frequency: str = "daily",
+        due_date: date | None = None,
     ) -> CareTask:
         """Factory for a new CareTask with a fresh id and incomplete status."""
         return CareTask(
@@ -312,7 +411,11 @@ class PawPalAppController:
             category=category,
             duration_minutes=duration_minutes,
             priority=priority,
+            frequency=frequency,
             is_required=is_required,
             notes=notes,
             is_complete=False,
+            time=time,
+            pet_name=pet_name,
+            due_date=due_date if due_date is not None else date.today(),
         )

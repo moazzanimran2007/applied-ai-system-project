@@ -1,8 +1,28 @@
 import streamlit as st
 from datetime import time
-from pawpal_system import ConstraintSet, Owner, PawPalAppController, Pet, TaskRepository, TimeWindow
+from logic import (
+    CareTask,
+    ConstraintSet,
+    Owner,
+    PawPalAppController,
+    Pet,
+    TaskRepository,
+    TimeWindow,
+)
 
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="centered")
+
+# Persist domain objects across reruns: only construct once, then mutate from widgets.
+# Check with `in` (or try/except KeyError). Avoid `setdefault(k, Owner(...))` because
+# `Owner(...)` is evaluated every run even when the key already exists.
+if "owner" not in st.session_state:
+    st.session_state.owner = Owner(
+        owner_id="owner-1",
+        name="Jordan",
+        available_minutes_per_day=180,
+    )
+if "pet" not in st.session_state:
+    st.session_state.pet = Pet(pet_id="pet-1", name="Mochi", species="dog")
 
 st.title("🐾 PawPal+")
 
@@ -118,11 +138,9 @@ st.subheader("Build Schedule")
 st.caption("This button should call your scheduling logic once you implement it.")
 
 if st.button("Generate schedule"):
-    owner = Owner(
-        owner_id="owner-1",
-        name=owner_name.strip() or "Owner",
-        available_minutes_per_day=int(available_minutes),
-    )
+    owner = st.session_state.owner
+    owner.name = owner_name.strip() or "Owner"
+    owner.available_minutes_per_day = int(available_minutes)
     owner.update_preferences(
         {
             "preferred_categories": [
@@ -130,7 +148,9 @@ if st.button("Generate schedule"):
             ]
         }
     )
-    pet = Pet(pet_id="pet-1", name=pet_name.strip() or "Pet", species=species)
+    pet = st.session_state.pet
+    pet.name = pet_name.strip() or "Pet"
+    pet.species = species
 
     repo = TaskRepository()
     controller = PawPalAppController(owner=owner, pet=pet, task_repo=repo)
