@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 import uuid
+import logging
 
 
 PRIORITY_SCORES = {"low": 1, "medium": 2, "high": 3}
@@ -296,14 +297,138 @@ class Scheduler:
 
 class PlanExplainer:
     def generate_reasons(self, plan: DailyPlan, constraints: ConstraintSet) -> list[str]:
-        """Produce summary bullets plus per-item explanations for a plan."""
+        """Produce summary bullets plus per-item explanations for a plan.
+
+        This method is augmented with a small Retrieval-Augmented step: it will consult
+        a local knowledge base (assets/*.txt) for short guidance snippets relevant to
+        scheduled task titles, categories, and the active constraints. Retrieved
+        snippets are included at the top of the explanation so downstream UIs can
+        surface them to users.
+        """
         summary = [
             f"Planned {len(plan.items)} tasks for {plan.total_minutes} minutes.",
             f"Remaining capacity: {plan.leftover_minutes} minutes.",
         ]
         if constraints.preferred_categories:
             summary.append(f"Preferred categories considered: {', '.join(constraints.preferred_categories)}.")
+
+        # Lightweight retriever: load local assets and rank snippets by keyword overlap.
+        retriever = _LocalRetriever()
+        # Build a small query corpus: task titles, categories, and must-include categories.
+        queries = [item.task.title for item in plan.items]
+        queries += [item.task.category for item in plan.items]
+        queries += list(constraints.must_include_categories)
+        queries = [q for q in queries if q]
+
+        retrieved = retriever.find_relevant_snippets(queries, top_k=3)
+        # Store for external use (UI/testing) and log for auditability.
+        try:
+            self.last_retrieved_snippets = list(retrieved)
+        except Exception:
+            # If PlanExplainer is used in a context where attributes are frozen,
+            # ignore silently but still continue to return the explanation.
+            pass
+        if retrieved:
+            logging.getLogger(__name__).info("Retrieved KB snippets: %s", retrieved)
+            summary.append("Relevant guidance from local knowledge:")
+            for s in retrieved:
+                summary.append(f"- {s}")
+
+        # Simple confidence heuristic (0..1): start at 0.4, boost for required tasks scheduled,
+        # penalize skipped reasons, and slightly boost when KB snippets are present.
+        try:
+            confidence = 0.4
+            # if at least one required task is scheduled, boost
+            if any(item.task.is_required for item in plan.items):
+                confidence += 0.2
+            # penalize if planner skipped tasks due to time
+            if plan.skipped_reasons:
+                confidence -= 0.15
+            # small boost for KB context
+            confidence += min(0.2, 0.05 * len(retrieved))
+            # normalize
+            confidence = max(0.0, min(1.0, confidence))
+            self.last_confidence = confidence
+            logging.getLogger(__name__).info("Plan confidence score: %.2f", confidence)
+        except Exception:
+            # best-effort: don't raise from explainer
+            try:
+                self.last_confidence = 0.0
+            except Exception:
+                pass
+
         return summary + plan.explain()
+
+
+class _LocalRetriever:
+    """Simple file-based retriever that returns snippets from text files in assets/.
+
+    It performs basic case-insensitive keyword matching and ranks by overlap count.
+    This is intentionally lightweight (no external deps) so tests remain fast and
+    the feature is reproducible.
+    """
+
+    def __init__(self, assets_dir: str | None = None) -> None:
+        import os
+
+        root = assets_dir or os.path.join(os.path.dirname(__file__), "assets")
+        self.snippets: list[str] = []
+        if os.path.isdir(root):
+            for name in os.listdir(root):
+                if not name.lower().endswith(".txt"):
+                    continue
+                try:
+                    with open(os.path.join(root, name), "r", encoding="utf-8") as fh:
+                        text = fh.read()
+                except Exception:
+                    continue
+                # Split into non-empty lines and keep lines as candidate snippets.
+                for line in [l.strip() for l in text.splitlines()]:
+                    if line:
+                        self.snippets.append(line)
+
+    def _score(self, snippet: str, query_terms: list[str]) -> int:
+        s = snippet.lower()
+        score = 0
+        for term in query_terms:
+            term = term.lower()
+            if not term:
+                continue
+            # Count occurrences (simple proxy for relevance)
+            score += s.count(term)
+            # Also give a small boost if the term appears as a whole word
+            if f" {term} " in f" {s} ":
+                score += 1
+        return score
+
+    def find_relevant_snippets(self, queries: list[str], top_k: int = 3) -> list[str]:
+        if not self.snippets or not queries:
+            return []
+        # Flatten queries into terms (split on non-alpha) to increase match chances
+        import re
+
+        terms: list[str] = []
+        for q in queries:
+            terms += [t for t in re.split(r"[^a-zA-Z0-9]+", q) if t]
+
+        scored: list[tuple[int, str]] = []
+        for s in self.snippets:
+            sc = self._score(s, terms)
+            if sc > 0:
+                scored.append((sc, s))
+
+        scored.sort(reverse=True, key=lambda x: x[0])
+        # Deduplicate while preserving order
+        seen = set()
+        out: list[str] = []
+        for _, snippet in scored:
+            if snippet in seen:
+                continue
+            seen.add(snippet)
+            out.append(snippet)
+            if len(out) >= top_k:
+                break
+        return out
 
 
 class TaskRepository:

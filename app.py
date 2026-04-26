@@ -183,6 +183,12 @@ if st.button("Generate schedule"):
     )
     plan = controller.create_daily_plan(constraints)
     explanation = controller.get_plan_explanation(plan, constraints)
+    # If the explainer stored the last retrieved snippets, surface them in the UI.
+    retrieved_snippets = []
+    try:
+        retrieved_snippets = controller.explainer.last_retrieved_snippets  # type: ignore[attr-defined]
+    except Exception:
+        retrieved_snippets = []
 
     if not plan.items:
         st.warning("No tasks could be scheduled with the current constraints.")
@@ -208,3 +214,8 @@ if st.button("Generate schedule"):
     st.markdown("### Why this plan")
     for line in explanation:
         st.write(f"- {line}")
+
+    if retrieved_snippets:
+        st.markdown("### KB snippets used for explanation")
+        for s in retrieved_snippets:
+            st.write(f"> {s}")
